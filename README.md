@@ -1,7 +1,7 @@
 # LokalAgent 
 ### Local Agentic AI with Ollama & LangChain
 
-LokalAgent is a fully local, privacy-first agentic AI system. It runs open-source LLMs entirely on your machine via Ollama — no API keys, no cloud dependency — with a Claude-style chat UI, multi-agent collaboration, and PageIndex-style vectorless RAG for PDF analysis.
+LokalAgent is a fully local, privacy-first agentic AI system. It runs open-source LLMs entirely on your machine via Ollama, no API keys, no cloud dependency, with a chat UI, multi-agent collaboration, and PageIndex-style vectorless RAG for PDF analysis.
 
 ---
 
