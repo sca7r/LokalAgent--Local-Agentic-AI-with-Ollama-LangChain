@@ -1,69 +1,108 @@
-# LokalAgent 
-### Local Agentic AI with Ollama & LangChain
+# LokalAgent 🤖
 
-LokalAgent is a fully local, privacy-first agentic AI system. It runs open-source LLMs entirely on your machine via Ollama, no API keys, no cloud dependency, with a chat UI, multi-agent collaboration, and PageIndex-style vectorless RAG for PDF analysis.
+**A fully local agentic AI system with Mixture of Experts (MoE) routing, structured JSON inter-agent communication, and constrained LLM outputs, running entirely on your machine via Ollama.**
+
+No cloud. No API costs. No data leaves your device.
 
 ---
 
-##  Features
+## What is this?
 
-- **100% local LLM** via Ollama (llama3, phi3, mistral, qwen2.5, and more)
-- **Single-agent mode** — ReAct reasoning loop with 5 built-in tools
-- **Multi-agent mode** — Planner → Executor → Reviewer pipeline with self-correction
-- **RAG** — vectorless, reasoning-based PDF search (no embeddings, no vector DB)
-- **PDF upload in UI** — attach PDFs directly in the chat interface
-- **Web search** — real-time internet access via Tavily
-- **Zero cloud cost** — runs entirely offline (except optional web search)
+LokalAgent is a local AI assistant built around two modes:
+
+- **Normal mode** - deepseek-r1 answers directly with streaming, just like ChatGPT
+- **Think mode** - activates a full MoE pipeline where a router breaks your task into steps, specialist experts handle each step, and a reviewer validates the result
+
+The key technical idea: instead of one general-purpose model doing everything poorly, LokalAgent routes each sub-task to the most capable specialist, a coding model for code, a pure Python engine for math, Tavily for live search and passes structured JSON between them so nothing gets lost in translation.
 
 ---
 
 ## Architecture
 
-### Single Agent (ReAct)
 ```
-User → ReAct Agent → [Think → Tool → Observe] loop → Final Answer
+User Query
+    │
+    ├── Normal Mode ──→ deepseek-r1:7b (streaming, conversational)
+    │
+    └── Think Mode ───→ Router (deepseek-r1)
+                            │
+                            ▼
+                    ┌───────────────────────────────────┐
+                    │  Specialist Experts               │
+                    │  ┌─────────┐  ┌───────────────┐  │
+                    │  │web_srch │  │  math (Python)│  │
+                    │  │(Tavily) │  │  no LLM       │  │
+                    │  └─────────┘  └───────────────┘  │
+                    │  ┌─────────┐  ┌───────────────┐  │
+                    │  │  code   │  │  file_write   │  │
+                    │  │(qwen2.5)│  │  pure Python  │  │
+                    │  └─────────┘  └───────────────┘  │
+                    │  ┌─────────┐  ┌───────────────┐  │
+                    │  │doc_srch │  │  api_call     │  │
+                    │  │(RAG PDF)│  │  HTTP client  │  │
+                    │  └─────────┘  └───────────────┘  │
+                    └───────────────────────────────────┘
+                            │
+                            ▼
+                    Reviewer (deepseek-r1)
+                            │
+                     pass? ─┴─ fail → retry with fix instructions (max 3)
+                            │
+                    Humaniser (deepseek-r1)
+                            │
+                    Clean answer to user
 ```
 
-### Multi-Agent Pipeline
-```
-User
- ↓
-Planner     — breaks task into ordered steps with tool assignments
- ↓
-Executor    — runs each step, extracts clean variables, chains results
- ↓
-Reviewer    — evaluates results, passes or sends feedback to Planner
- ↓ (loop up to 3 iterations)
-Final Answer
-```
+### RAM Management
 
-### RAG
-```
-PDF Upload
- ↓
-Indexer     — tags pages as <physical_index_X>, detects TOC (Table of Contents) (3 paths),
-              builds hierarchical tree, verifies + self-corrects indices
- ↓
-JSON Tree Index (cached)
- ↓
-Retriever   — iterative loop: read TOC → select section → fetch text →
-              check if sufficient → repeat → generate answer
-```
+Only **one LLM lives in RAM at a time**. Ollama's `keep_alive=0` unloads each model immediately after use. deepseek-r1 (router/reviewer) and qwen2.5-coder (code steps) swap in and out as needed, making the system work on machines with 8–10GB RAM.
 
 ---
 
-##  Tech Stack
+## Key Technical Decisions
 
-| Layer | Technology |
-|---|---|
-| Agent framework | LangChain (ReAct) |
-| LLM backend | Ollama |
-| Multi-agent | Custom Planner / Executor / Reviewer |
-| RAG | Custom style (vectorless) |
-| Web search | Tavily API |
-| Code execution | LangChain Python REPL |
-| Web UI | Flask + Vanilla JS |
-| Language | Python 3.10+ |
+### Structured JSON Inter-Expert Communication
+
+Every expert sends and receives typed JSON matching a contract schema:
+
+```json
+{
+  "status":     "ok",
+  "expert":     "web_search",
+  "task":       "find current gold price",
+  "result": {
+    "value":      4623.93,
+    "value_type": "number",
+    "unit":       "USD/oz",
+    "summary":    "Gold spot price is $4,623.93 per troy ounce as of March 22 2026"
+  },
+  "confidence": "high",
+  "error":      "",
+  "raw":        "..."
+}
+```
+
+This eliminates regex-based value extraction between steps, the math expert reads `step1_value = 4623.93` (a Python float), not `"Gold spot price is $4,623.93..."` (a string to parse).
+
+### Constrained LLM Outputs via Ollama Structured Outputs
+
+The router and reviewer use Ollama's `format` parameter with Pydantic schemas. This passes the schema to llama.cpp as a GBNF grammar, invalid tokens are masked at sampling time. The model cannot produce malformed JSON.
+
+Nested Pydantic models generate `$defs`/`$ref` in JSON Schema, which Ollama's grammar engine doesn't support. `schema_utils.py` resolves all references inline before passing to Ollama, preserving full schema structure without breaking constrained decoding.
+
+### Search → Extract → Use Pipeline
+
+Web search follows a clean three-step pipeline:
+
+1. **Fetch** — Tavily retrieves raw text from the web (no LLM)
+2. **Extract** — deepseek reads raw text + task context → `ExtractionResult` JSON with typed value
+3. **Pass** — clean typed value (`4623.93`, not a sentence) flows to the next expert
+
+This means math, file, and code experts always receive clean typed data, they never parse raw search text.
+
+### PageIndex RAG (Vectorless PDF Search)
+
+PDF search uses a reasoning-based approach inspired by [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex). Pages are tagged with `<physical_index_X>` markers, a hierarchical TOC is built via LLM, and retrieval iterates: read TOC → select section → fetch text → check sufficient → repeat. No embeddings, no vector database.
 
 ---
 
@@ -72,178 +111,195 @@ Retriever   — iterative loop: read TOC → select section → fetch text →
 ```
 LokalAgent/
 ├── src/
-│   ├── app.py              # Flask backend - all API routes
-│   ├── agent.py            # CLI agent entrypoint
-│   └── index.html          # Claude-style chat UI
-├── agents/
-│   ├── planner.py          # Planner agent - task → JSON plan
-│   ├── executor.py         # Executor agent - runs tools, chains results
-│   ├── reviewer.py         # Reviewer agent - evaluates, gives feedback
-│   └── orchestrator.py     # Coordinates the 3-agent pipeline
+│   ├── app.py              # Flask backend - /chat (stream) and /think (MoE+SSE)
+│   └── index.html          # Chat UI
+│
+├── moe/
+│   ├── router.py           # deepseek-r1: task → ordered plan (constrained JSON)
+│   ├── reviewer.py         # deepseek-r1: evaluate results, generate fix instructions
+│   ├── orchestrator.py     # coordinates router → experts → reviewer loop
+│   ├── expert_contract.py  # JSON schema, sanitization, call_with_schema()
+│   ├── schema_utils.py     # $defs/$ref resolver for Ollama compatibility
+│   ├── memory_manager.py   # Ollama model load/unload (one model in RAM at a time)
+│   ├── config_loader.py    # reads moe_config.yaml
+│   ├── moe_config.yaml     # models, experts, behaviour - edit without touching code
+│   └── experts/
+│       ├── searcher.py     # Tavily fetch + LLM extract → typed JSON
+│       ├── math_engine.py  # pure Python arithmetic - no LLM, no hallucination
+│       ├── coder.py        # qwen2.5-coder:7b - generates + runs code
+│       ├── file_expert.py  # pure Python read/write
+│       ├── api_expert.py   # HTTP calls
+│       └── doc_expert.py   # PageIndex RAG for PDFs
+│
 ├── rag/
-│   ├── indexer.py          # PDF tree builder
-│   ├── retriever.py        # Iterative tree-search retriever
-│   └── utils.py            # LLM calls, PDF parsing, token counting
-├── tools/
-│   ├── search.py           # Web search (Tavily)
-│   ├── code_exec.py        # Python REPL
-│   ├── file_ops.py         # File read/write
-│   ├── api_call.py         # HTTP API calls
-│   └── doc_search.py       # PDF document search tool
-├── config.py               # Model name, Ollama URL, settings
-├── memory.py               # Sliding-window conversation memory
-├── requirements.txt
-└── .env.example
+│   ├── indexer.py          # PageIndex-style PDF tree builder
+│   ├── retriever.py        # iterative tree-search retrieval
+│   └── utils.py            # LLM helpers, page tagging, token counting
+│
+├── tools/                  # LangChain tool wrappers (used by single agent)
+├── moe_config.yaml         # model + expert configuration
+└── requirements.txt
 ```
 
 ---
 
-##  Getting Started
+## Models
 
-### 1. Prerequisites
+| Role | Model | Why |
+|---|---|---|
+| Router + Reviewer + Direct answers | `deepseek-r1:7b` | Chain-of-thought reasoning, self-verification |
+| Code generation | `qwen2.5-coder:7b` | Trained specifically on code, fewer syntax errors |
+| Math | Python `sympy` + stdlib | No hallucination possible, pure computation |
+| Web search | Tavily API | Real-time data, no LLM needed |
+
+---
+
+## Getting Started
+
+### Prerequisites
 
 - Python 3.10+
 - [Ollama](https://ollama.com) installed and running
 
-### 2. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/your-username/LokalAgent.git
 cd LokalAgent
 ```
 
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Pull a model via Ollama
+### 3. Pull models
 
 ```bash
-ollama pull llama3       # recommended for best results
-# or
-ollama pull phi3:mini    # lighter, faster on low-RAM machines
+ollama pull deepseek-r1:7b
+ollama pull qwen2.5-coder:7b
 ```
 
-### 5. (Optional) Enable web search
+### 4. Configure web search (optional)
 
-Sign up free at [tavily.com](https://tavily.com) and add your key:
+Sign up free at [tavily.com](https://tavily.com), then:
 
 ```bash
 cp .env.example .env
-# Edit .env and add: TAVILY_API_KEY=tvly-your-key-here
+# Add your key: TAVILY_API_KEY=tvly-your-key-here
 ```
 
-### 6. Run
+### 5. Run
 
 ```bash
 python3 src/app.py
 ```
 
-Open **http://localhost:5000** in your browser.
+Open **http://localhost:5000**
 
 ---
 
-##  Usage
+## Usage
 
-### Single agent mode
-Ask anything directly:
+### Normal mode
+Type any question, deepseek-r1 answers with streaming, showing its thinking process in a collapsible panel.
+
 ```
-What is the weather in Bengaluru right now?
-Calculate compound interest on ₹50,000 at 8% for 5 years
-Fetch the GitHub profile for torvalds via API
+What is quantum entanglement?
+Write a poem about the ocean
+Explain the difference between TCP and UDP
 ```
 
-### Multi-agent mode
-Switch to **Multi agent** in the header and give multi-step tasks:
+### Think mode
+Click the **✨ Think** button to activate the MoE pipeline for multi-step tasks:
+
 ```
-Search for the latest Bitcoin price, calculate 15% of it, and save to crypto.txt
-Find the top 3 Python web frameworks and write a comparison to frameworks.md
+Search the current gold price, calculate 10%, and save to gold.txt
+Find the top 5 Python web frameworks and write a comparison to frameworks.md
+What is the weather in Mumbai today?
 ```
 
 ### PDF upload
-Click the 📎 paperclip → select a PDF → wait for indexing → ask questions:
+Click 📎 → select a PDF → wait for indexing → ask questions about it:
+
 ```
-What are the key findings in this document?
-Summarise section 3
-What does the document say about methodology?
-```
-
----
-
-##  Configuration
-
-Edit `config.py`:
-
-```python
-MODEL_NAME       = "llama3:latest"   # any Ollama model
-OLLAMA_BASE_URL  = "http://localhost:11434"
-MAX_ITERATIONS   = 10                # single agent max steps
+Summarise this document
+What does section 3 say about methodology?
+List all the key findings
 ```
 
 ---
 
-##  Known Limitations
+## Configuration
 
-### Multi-agent with small models (phi3:mini)
-- phi3:mini often fails to generate valid JSON plans — falls back to keyword-based planning
-- Calculation steps may be inaccurate when the LLM misreads extracted values
-- **Workaround:** Use `llama3:latest` for multi-agent tasks
+Edit `moe/moe_config.yaml` to change models or behaviour, no code changes needed:
 
-### RAG indexing speed
-- Indexing is slow on CPU-only machines (no GPU)
-- A 10-page PDF takes 3–5 minutes on an i7 with 8GB RAM
-- **Workaround:** Indexed PDFs are cached — re-uploading the same PDF loads instantly
+```yaml
+models:
+  router:   "deepseek-r1:7b"
+  coder:    "qwen2.5-coder:7b"
+  fallback: "llama3:latest"
 
-### LLM hallucination in multi-agent pipelines
-- When chaining steps, the LLM occasionally generates incorrect Python code
-- The Reviewer catches most errors and re-runs the pipeline (up to 3 iterations)
-- Complex calculations are more reliable with llama3 than phi3
+user:
+  preferred_language: "python"   # code generation language
 
-### Context window
-- Ollama's default context window is 4096 tokens
-- Very long search results or large PDFs may be truncated
-- **Workaround:** The RAG indexer chunks documents into sections to stay within limits
+behaviour:
+  max_retries: 3
+  unload_after_use: true
+```
 
 ---
 
-##  TODO
+## Honest Limitations
 
-### High priority
-- [ ] **Docker deployment** - single `docker-compose up` to run everything
-- [ ] **Fix multi-agent calculation accuracy** - replace LLM code generation with a sandboxed Python evaluator that parses the task directly
-- [ ] **Streaming responses** - stream LLM tokens to the UI instead of waiting for the full response
-- [ ] **Better context chaining** - structured JSON passing between agent steps instead of string injection
-
-### Features
-- [ ] **Conversation history persistence** - save and reload past conversations
-- [ ] **Tool usage analytics dashboard** - track which tools are used, success rates, latency
-- [ ] **Custom tool builder** - add new tools from the UI without editing code
-- [ ] **Voice input** - speak your queries using browser speech API
-- [ ] **Multiple PDF support** - index and search across multiple documents simultaneously
-
-### RAG improvements
-- [ ] **Async indexing** - show real-time progress while PDF is being indexed
-- [ ] **Vision RAG** - support scanned PDFs using page image analysis
-- [ ] **Cross-document references** - follow "see Appendix G" style links between sections
-
-### Model & performance
-- [ ] **GPU acceleration** - auto-detect and use GPU via Ollama
-- [ ] **Model benchmarking** - compare phi3 vs llama3 vs mistral on standard tasks
-- [ ] **Prompt caching** - cache repeated LLM calls to speed up re-runs
+| Limitation | Detail |
+|---|---|
+| **Model quality** | deepseek-r1:7b is a 7B parameter model. GPT-4/Claude use 100B+. Answers are less reliable on complex reasoning. |
+| **RAM** | Running two 4.7GB models requires 8GB+ RAM. Only one loads at a time. |
+| **Speed** | Each LLM call takes 8–20s on CPU. Multi-step tasks can take 2–5 minutes. |
+| **Constrained outputs** | Schema is enforced at token level for router/reviewer. Other experts use prompt-based JSON with sanitization fallback. |
+| **Web search** | Requires Tavily API key and internet access. |
+| **RAG indexing** | Slow on CPU, a 10-page PDF takes 3–5 minutes to index. Cached after first run. |
 
 ---
 
-##  License
+## What I Learned Building This
 
-MIT License — free to use, modify, and distribute.
+- **MoE at agent level** — routing to specialist models/tools is more reliable than asking one model to do everything
+- **Structured outputs matter** — the difference between asking an LLM to "return JSON" vs enforcing the schema at token level is significant
+- **$defs in JSON Schema** — Pydantic's nested model schemas use `$ref` pointers that Ollama's grammar engine can't parse; they need to be resolved inline before passing to the constrained decoder
+- **Separation of concerns** — searcher fetches and extracts, math computes, file writes; each expert does one thing well
+- **Small models are opinionated** — deepseek-r1:7b follows instructions reliably but phi3:mini does not; model selection is as important as architecture
 
 ---
 
-##  Acknowledgements
+## Tech Stack
 
-- [LangChain](https://langchain.com) — agent framework
+| Layer | Technology |
+|---|---|
+| LLM backend | Ollama |
+| Constrained outputs | Ollama structured outputs + llama.cpp GBNF grammars |
+| Schema validation | Pydantic v2 |
+| Agent framework | LangChain (streaming, tools) |
+| Web search | Tavily API |
+| RAG | Custom PageIndex-style (no vector DB) |
+| Web UI | Flask + Vanilla JS (SSE streaming) |
+| Math | Python stdlib + sympy |
+
+---
+
+## Acknowledgements
+
 - [Ollama](https://ollama.com) — local LLM runtime
-- [Tavily](https://tavily.com) — AI-optimised web search
-- [PageIndex by VectifyAI](https://github.com/VectifyAI/PageIndex) - inspiration for vectorless RAG architecture
+- [deepseek-r1](https://github.com/deepseek-ai/DeepSeek-R1) — reasoning model
+- [qwen2.5-coder](https://github.com/QwenLM/Qwen2.5-Coder) — coding model  
+- [Tavily](https://tavily.com) — AI-optimised web search API
+- [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) — inspiration for vectorless RAG
+- [LangChain](https://langchain.com) — agent and tool framework
+
+---
+
+## License
+
+MIT — free to use, modify, and distribute.

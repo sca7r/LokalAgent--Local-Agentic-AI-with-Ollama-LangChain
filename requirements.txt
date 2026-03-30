@@ -1,9 +1,25 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+flask>=3.0.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.2
+requests>=2.31.0
+
+# ── LangChain ─────────────────────────────────────────────────────────────────
 langchain==0.3.7
 langchain-community==0.3.7
 langchain-ollama==0.2.1
 langchain-experimental==0.3.4
-tavily-python>=0.3.0
-requests>=2.31.0
-flask>=3.0.0
-python-dotenv>=1.0.0
-pypdf
+
+# ── Ollama ────────────────────────────────────────────────────────────────────
+# Install Ollama separately: https://ollama.com
+# Then pull models:
+#   ollama pull llama3:latest
+#   ollama pull phi3:mini
+#   ollama pull deepseek-r1:7b
+#   ollama pull qwen2.5-coder:7b
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+tavily-python>=0.3.0       # web search (optional — needs TAVILY_API_KEY)
+pypdf>=4.0.0               # PDF parsing for RAG
+sympy>=1.12                # math expert — pure Python calculations
+ollama pydantic

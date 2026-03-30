@@ -1,0 +1,75 @@
+# LokalAgent MoE Configuration
+# Edit this file to change models, add experts, or tune behaviour.
+# No code changes needed.
+
+# ── Models ────────────────────────────────────────────────────────────────────
+models:
+  router:   "deepseek-r1:7b"    # Routes tasks and reviews results
+  coder:    "qwen2.5-coder:7b"  # Python code generation only
+  fallback: "llama3:latest"     # Used if primary model not available
+
+# ── Single agent models (shown in UI dropdown) ────────────────────────────────
+single_agent_models:
+  - "phi3:mini"
+  - "llama3:latest"
+  - "deepseek-r1:7b"
+
+# ── Expert configuration ──────────────────────────────────────────────────────
+experts:
+  web_search:
+    description: "Search the internet for current information"
+    type: "api"           # api = no LLM needed
+    enabled: true
+
+  math:
+    description: "Perform mathematical calculations"
+    type: "python"        # python = pure Python, no LLM
+    enabled: true
+
+  code:
+    description: "Write and execute Python code"
+    type: "llm"           # llm = uses coder model
+    model: "qwen2.5-coder:7b"
+    enabled: true
+
+  file_read:
+    description: "Read a file from the filesystem"
+    type: "python"
+    enabled: true
+
+  file_write:
+    description: "Write content to a file"
+    type: "python"
+    enabled: true
+
+  api_call:
+    description: "Make an HTTP API request"
+    type: "api"
+    enabled: true
+
+  doc_search:
+    description: "Search an uploaded PDF document"
+    type: "rag"
+    enabled: true
+
+  direct_answer:
+    description: "Answer directly without any tool — for simple questions"
+    type: "direct"        # direct = no tool, no LLM call
+    enabled: true
+
+# ── User preferences ─────────────────────────────────────────────────────────
+user:
+  preferred_language: "python"   # default coding language
+  # other options: javascript, typescript, java, go, rust, cpp, bash
+
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+behaviour:
+  max_retries: 3
+  unload_after_use: true     # free RAM after each model call
+  stream_progress: true      # send step updates to UI
+  direct_answer_threshold:   # keywords that trigger direct answer
+    - "hello"
+    - "hi"
+    - "what is your name"
+    - "who are you"
+    - "help"

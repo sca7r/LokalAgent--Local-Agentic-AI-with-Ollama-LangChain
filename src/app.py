@@ -1,233 +1,239 @@
 """
-LokalAgent GUI — Flask backend
+LokalAgent — Flask backend
+Two modes:
+  Normal : deepseek-r1 answers directly (fast, conversational)
+  Think  : MoE pipeline (router → experts → reviewer)
 """
 
 import sys, os
-
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, _root)
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from langchain_ollama import ChatOllama
-from langchain.agents import create_react_agent
-from langchain.agents.agent import AgentExecutor
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain.memory import ConversationBufferWindowMemory
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain import hub
+from moe.orchestrator import run_moe
+from moe.config_loader import load as load_config
+from tools.doc_search import set_index, clear_index
 
-from tools.code_exec import get_code_exec_tool
-from tools.file_ops import get_file_tools
-from tools.api_call import get_api_tool
-from tools.search import get_search_tool
-from tools.doc_search import get_doc_search_tool, set_index, clear_index
-from agents.orchestrator import run_multi_agent
+import threading, json, re
 
-import threading, json
+app  = Flask(__name__)
 
-app = Flask(__name__)
+DIRECT_MODEL   = "deepseek-r1:7b"
+SYSTEM_PROMPT  = (
+    "You are LokalAgent, a helpful local AI assistant built with Ollama. "
+    "Answer concisely and directly. "
+    "If you don't know something or need real-time data, say so clearly."
+)
 
-MODELS       = ["phi3:mini", "llama3:latest"]
-UPLOAD_DIR   = os.path.join(_root, "uploads")
-INDEX_DIR    = os.path.join(_root, "indexes")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(INDEX_DIR,  exist_ok=True)
-
-agents:   dict = {}
-memories: dict = {}
+# Conversation memory per session
+_sessions: dict = {}   # session_id → list of messages
 
 
-# ── Callback to capture tool usage ──────────────────────────────────────────
-class ToolCaptureCallback(BaseCallbackHandler):
-    def __init__(self):
-        self.tools_used = []
-
-    def on_tool_start(self, serialized, input_str, **kwargs):
-        self.tools_used.append(serialized.get("name", "unknown"))
+def get_history(session_id: str) -> list:
+    return _sessions.get(session_id, [])
 
 
-# ── Agent builder ────────────────────────────────────────────────────────────
-def build_agent(model_name: str) -> AgentExecutor:
-    llm = ChatOllama(
-        model=model_name,
-        base_url="http://localhost:11434",
-        temperature=0,
-    )
-    tools = [
-        get_doc_search_tool(),
-        get_code_exec_tool(),
-        *get_file_tools(),
-        get_api_tool(),
-    ]
-    search = get_search_tool()
-    if search:
-        tools.insert(0, search)
-
-    memory = ConversationBufferWindowMemory(
-        memory_key="chat_history", k=10, return_messages=True
-    )
-    from langchain.prompts import PromptTemplate
-    prompt = PromptTemplate.from_template(
-        "You are a concise AI assistant. Answer the user's question directly and briefly.\n\n"
-        "You have access to these tools:\n{tools}\n\n"
-        "Use this format:\n"
-        "Question: the input question\n"
-        "Thought: think about what to do\n"
-        "Action: tool name, one of [{tool_names}]\n"
-        "Action Input: input to the tool\n"
-        "Observation: result of the tool\n"
-        "Thought: I now have enough information to answer\n"
-        "Final Answer: give a SHORT, direct answer using the observation\n\n"
-        "IMPORTANT: After getting an Observation, go straight to Final Answer. Do not write articles or long explanations.\n\n"
-        "Chat history:\n{chat_history}\n\n"
-        "Question: {input}\n"
-        "Thought:{agent_scratchpad}"
-    )
-    agent  = create_react_agent(llm=llm, tools=tools, prompt=prompt)
-    memories[model_name] = memory
-    return AgentExecutor(
-        agent=agent, tools=tools, memory=memory,
-        verbose=True, max_iterations=10,
-        handle_parsing_errors=True,
-    )
+def add_to_history(session_id: str, role: str, content: str):
+    if session_id not in _sessions:
+        _sessions[session_id] = []
+    _sessions[session_id].append({"role": role, "content": content})
+    # Keep last 20 messages
+    _sessions[session_id] = _sessions[session_id][-20:]
 
 
-def get_agent(model_name: str) -> AgentExecutor:
-    if model_name not in agents:
-        agents[model_name] = build_agent(model_name)
-    return agents[model_name]
-
-
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
 
-@app.route("/models")
-def list_models():
-    return jsonify({"models": MODELS})
-
-
-@app.route("/upload", methods=["POST"])
-def upload_pdf():
-    """Receive a PDF, build PageIndex tree, register doc_search tool."""
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-
-    file = request.files["file"]
-    if not file.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Only PDF files are supported"}), 400
-
-    # Save PDF
-    pdf_path   = os.path.join(UPLOAD_DIR, file.filename)
-    index_path = os.path.join(INDEX_DIR,  file.filename.replace(".pdf", ".json"))
-    file.save(pdf_path)
-
-    model = request.form.get("model", MODELS[0])
-
-    # Load cached index if it exists
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            doc_index = json.load(f)
-        set_index(doc_index)
-        return jsonify({
-            "status":   "indexed",
-            "filename": file.filename,
-            "pages":    doc_index["total_pages"],
-            "nodes":    doc_index["total_nodes"],
-            "cached":   True,
-        })
-
-    # Build new index
-    try:
-        from rag.indexer import build_index
-        doc_index = build_index(
-            pdf_path=pdf_path,
-            model_name=model,
-            index_path=index_path,
-        )
-        set_index(doc_index)
-        return jsonify({
-            "status":   "indexed",
-            "filename": file.filename,
-            "pages":    doc_index["total_pages"],
-            "nodes":    doc_index["total_nodes"],
-            "cached":   False,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/chat", methods=["POST"])
 def chat():
-    data     = request.json
-    user_msg = data.get("message", "").strip()
-    model    = data.get("model", MODELS[0])
+    """Normal mode — deepseek-r1 answers directly with streaming."""
+    data       = request.json
+    user_msg   = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
 
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
-    cb = ToolCaptureCallback()
-    try:
-        executor = get_agent(model)
-        result   = executor.invoke(
-            {"input": user_msg},
-            config={"callbacks": [cb]}
+    add_to_history(session_id, "user", user_msg)
+    history = get_history(session_id)
+
+    def generate():
+        llm = ChatOllama(
+            model=DIRECT_MODEL,
+            base_url="http://localhost:11434",
+            temperature=0.7,
         )
-        return jsonify({
-            "response":   result.get("output", ""),
-            "tools_used": cb.tools_used,
-        })
+
+        # Build message list
+        messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        for msg in history[:-1]:   # exclude current message (already added)
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            else:
+                messages.append(AIMessage(content=msg["content"]))
+        messages.append(HumanMessage(content=user_msg))
+
+        full_response = ""
+        thinking_text = ""
+        in_think = False
+
+        try:
+            print(f"\n[deepseek] Thinking: ", end='', flush=True)
+            for chunk in llm.stream(messages):
+                token = chunk.content
+                if not token:
+                    continue
+
+                # Handle <think> blocks from deepseek-r1
+                if "<think>" in token:
+                    in_think = True
+                if "</think>" in token:
+                    in_think = False
+                    # Send end of thinking signal
+                    yield f"data: {json.dumps({'type': 'think_end'})}\n\n"
+                    continue
+
+                if in_think:
+                    thinking_text += token
+                    yield f"data: {json.dumps({'type': 'think', 'token': token})}\n\n"
+                else:
+                    full_response += token
+                    yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+
+            add_to_history(session_id, "assistant", full_response)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/think", methods=["POST"])
+def think():
+    """Think mode — full MoE pipeline with SSE progress streaming."""
+    data     = request.json
+    task     = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
+
+    if not task:
+        return jsonify({"error": "empty task"}), 400
+
+    def generate():
+        import queue
+        q = queue.Queue()
+
+        def callback(event):
+            q.put(event)
+
+        def worker():
+            try:
+                result = run_moe(task=task, progress_callback=callback)
+                q.put({
+                    "type":       "done",
+                    "response":   result["final_answer"],
+                    "tools_used": result["tools_used"],
+                    "attempts":   result["attempts"],
+                })
+                add_to_history(session_id, "user", task)
+                add_to_history(session_id, "assistant", result["final_answer"])
+            except Exception as e:
+                q.put({"type": "error", "message": str(e)})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = q.get()
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") in ("done", "error"):
+                break
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/upload", methods=["POST"])
+def upload_pdf():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files supported"}), 400
+
+    UPLOAD_DIR = os.path.join(_root, "uploads")
+    INDEX_DIR  = os.path.join(_root, "indexes")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(INDEX_DIR,  exist_ok=True)
+
+    pdf_path   = os.path.join(UPLOAD_DIR, file.filename)
+    index_path = os.path.join(INDEX_DIR,  file.filename.replace(".pdf", ".json"))
+    file.save(pdf_path)
+
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            doc_index = json.load(f)
+        set_index(doc_index)
+        return jsonify({"status": "indexed", "filename": file.filename,
+                        "pages": doc_index["total_pages"],
+                        "nodes": doc_index["total_nodes"], "cached": True})
+    try:
+        from rag.indexer import build_index
+        doc_index = build_index(pdf_path=pdf_path, model_name=DIRECT_MODEL, index_path=index_path)
+        set_index(doc_index)
+        return jsonify({"status": "indexed", "filename": file.filename,
+                        "pages": doc_index["total_pages"],
+                        "nodes": doc_index["total_nodes"], "cached": False})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/clear", methods=["POST"])
-def clear_memory():
-    data  = request.json or {}
-    model = data.get("model", MODELS[0])
-    if model in memories:
-        memories[model].clear()
-    if model in agents:
-        del agents[model]
+def clear():
+    data       = request.json or {}
+    session_id = data.get("session_id", "default")
+    if session_id in _sessions:
+        del _sessions[session_id]
     clear_index()
     return jsonify({"status": "cleared"})
 
 
-@app.route("/multi-agent", methods=["POST"])
-def multi_agent():
-    data     = request.json
-    task     = data.get("message", "").strip()
-    model    = data.get("model", MODELS[0])
-
-    if not task:
-        return jsonify({"error": "empty task"}), 400
-
+@app.route("/set-language", methods=["POST"])
+def set_language():
+    lang = request.json.get("language", "python")
+    import moe.config_loader as cl
+    import yaml
+    cfg = cl.load()
+    if "user" not in cfg:
+        cfg["user"] = {}
+    cfg["user"]["preferred_language"] = lang
+    config_path = os.path.join(_root, "moe", "moe_config.yaml")
     try:
-        result = run_multi_agent(task=task, model=model)
-        # Format a rich response showing the plan + final answer
-        plan_summary = "\n".join([
-            f"Step {s.get('step')}: {s.get('description')} [{s.get('tool')}]"
-            for s in result["plan"]
-        ])
-        response_text = (
-            f"**Plan ({result['iterations']} iteration(s)):**\n{plan_summary}\n\n"
-            f"**Result:**\n{result['final_answer']}"
-        )
-        return jsonify({
-            "response":   response_text,
-            "tools_used": result["tools_used"],
-            "iterations": result["iterations"],
-        })
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        if "user" not in raw:
+            raw["user"] = {}
+        raw["user"]["preferred_language"] = lang
+        with open(config_path, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[Config] Could not persist language: {e}")
+    return jsonify({"status": "ok", "language": lang})
 
 
 if __name__ == "__main__":
-    print("LokalAgent GUI → http://localhost:5000")
-    app.run(debug=True, port=5000, threaded=True, request_handler=None)
-
-# Increase werkzeug timeout for slow LLM responses
-import socket
-socket.setdefaulttimeout(600)  # 10 minutes
+    print(f"LokalAgent → http://localhost:5000  |  Model: {DIRECT_MODEL}")
+    app.run(debug=True, port=5000, threaded=True)
